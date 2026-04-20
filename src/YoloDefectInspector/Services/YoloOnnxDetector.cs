@@ -79,11 +79,19 @@ public sealed class YoloOnnxDetector : IDisposable
         var scaleX = (float)image.Width / InputWidth;
         var scaleY = (float)image.Height / InputHeight;
 
-        var tensor = CreateInputTensor(image);
         var inputName = _session.InputMetadata.Keys.First();
+        var inputMeta = _session.InputMetadata[inputName];
+        NamedOnnxValue inputValue = inputMeta.ElementDataType switch
+        {
+            TensorElementType.Float => NamedOnnxValue.CreateFromTensor(inputName, CreateInputTensor(image)),
+            TensorElementType.Float16 => NamedOnnxValue.CreateFromTensor(inputName, CreateInputTensorFloat16(image)),
+            _ => throw new InvalidOperationException(
+                $"模型输入类型不受支持：{inputMeta.ElementDataType}。当前仅支持 Float/Float16。")
+        };
+
         using var inputs = new List<NamedOnnxValue>
         {
-            NamedOnnxValue.CreateFromTensor(inputName, tensor)
+            inputValue
         };
 
         IDisposableReadOnlyCollection<DisposableNamedOnnxValue> results;
@@ -91,36 +99,37 @@ public sealed class YoloOnnxDetector : IDisposable
         {
             results = _session.Run(inputs);
         }
-        catch (OnnxRuntimeException ex) when (IsFloat16Mismatch(ex))
+        catch (OnnxRuntimeException ex)
         {
-            throw new InvalidOperationException(
-                "模型输入类型为 Float16，但当前示例按 Float32 预处理。请重新导出 FP32 ONNX（不要 half/FP16 量化）。",
-                ex);
+            throw new InvalidOperationException($"ONNX 推理执行失败：{ex.Message}", ex);
         }
 
         using (results)
         {
-            Tensor<float> output;
-            try
+            var outputMeta = _session.OutputMetadata.Values.FirstOrDefault();
+            if (outputMeta is null)
             {
-                output = results.First().AsTensor<float>();
-            }
-            catch (OnnxRuntimeException ex) when (IsFloat16Mismatch(ex))
-            {
-                throw new InvalidOperationException(
-                    "模型输出类型为 Float16，但当前示例解析按 Float32。请改用 FP32 导出的 YOLO ONNX 模型。",
-                    ex);
+                throw new InvalidOperationException("模型未提供可用输出节点。");
             }
 
-            var detections = ParseOutput(output, confThreshold, iouThreshold, scaleX, scaleY);
-            return detections;
+            return outputMeta.ElementDataType switch
+            {
+                TensorElementType.Float => ParseOutput(
+                    results.First().AsTensor<float>(),
+                    confThreshold,
+                    iouThreshold,
+                    scaleX,
+                    scaleY),
+                TensorElementType.Float16 => ParseOutput(
+                    results.First().AsTensor<Float16>(),
+                    confThreshold,
+                    iouThreshold,
+                    scaleX,
+                    scaleY),
+                _ => throw new InvalidOperationException(
+                    $"模型输出类型不受支持：{outputMeta.ElementDataType}。当前仅支持 Float/Float16。")
+            };
         }
-    }
-
-    private static bool IsFloat16Mismatch(OnnxRuntimeException ex)
-    {
-        return ex.Message.IndexOf("Float16", StringComparison.OrdinalIgnoreCase) >= 0 &&
-               ex.Message.IndexOf("Float", StringComparison.OrdinalIgnoreCase) >= 0;
     }
 
     private static DenseTensor<float> CreateInputTensor(Bitmap source)
@@ -148,6 +157,31 @@ public sealed class YoloOnnxDetector : IDisposable
         return tensor;
     }
 
+    private static DenseTensor<Float16> CreateInputTensorFloat16(Bitmap source)
+    {
+        using var resized = new Bitmap(InputWidth, InputHeight);
+        using (var graphics = Graphics.FromImage(resized))
+        {
+            graphics.InterpolationMode = InterpolationMode.HighQualityBicubic;
+            graphics.DrawImage(source, 0, 0, InputWidth, InputHeight);
+        }
+
+        var tensor = new DenseTensor<Float16>(new[] { 1, 3, InputHeight, InputWidth });
+
+        for (var y = 0; y < InputHeight; y++)
+        {
+            for (var x = 0; x < InputWidth; x++)
+            {
+                var color = resized.GetPixel(x, y);
+                tensor[0, 0, y, x] = (Float16)(color.R / 255f);
+                tensor[0, 1, y, x] = (Float16)(color.G / 255f);
+                tensor[0, 2, y, x] = (Float16)(color.B / 255f);
+            }
+        }
+
+        return tensor;
+    }
+
     private IReadOnlyList<DefectResult> ParseOutput(
         Tensor<float> output,
         float confThreshold,
@@ -155,8 +189,40 @@ public sealed class YoloOnnxDetector : IDisposable
         float scaleX,
         float scaleY)
     {
+        return ParseOutputCore(
+            output.Dimensions,
+            (i, j) => output[0, i, j],
+            confThreshold,
+            iouThreshold,
+            scaleX,
+            scaleY);
+    }
+
+    private IReadOnlyList<DefectResult> ParseOutput(
+        Tensor<Float16> output,
+        float confThreshold,
+        float iouThreshold,
+        float scaleX,
+        float scaleY)
+    {
+        return ParseOutputCore(
+            output.Dimensions,
+            (i, j) => output[0, i, j].ToFloat(),
+            confThreshold,
+            iouThreshold,
+            scaleX,
+            scaleY);
+    }
+
+    private IReadOnlyList<DefectResult> ParseOutputCore(
+        IReadOnlyList<int> dimensions,
+        Func<int, int, float> valueAt,
+        float confThreshold,
+        float iouThreshold,
+        float scaleX,
+        float scaleY)
+    {
         // 针对常见 YOLOv5 输出维度 [1, 25200, 85]。
-        var dimensions = output.Dimensions;
         if (dimensions.Count < 3)
         {
             throw new InvalidOperationException("YOLO 输出维度不符合预期。");
@@ -169,7 +235,7 @@ public sealed class YoloOnnxDetector : IDisposable
 
         for (var i = 0; i < rows; i++)
         {
-            var objConfidence = output[0, i, 4];
+            var objConfidence = valueAt(i, 4);
             if (objConfidence < confThreshold)
             {
                 continue;
@@ -179,7 +245,7 @@ public sealed class YoloOnnxDetector : IDisposable
             var bestClassScore = 0f;
             for (var c = 0; c < classes; c++)
             {
-                var classScore = output[0, i, 5 + c];
+                var classScore = valueAt(i, 5 + c);
                 if (classScore > bestClassScore)
                 {
                     bestClass = c;
@@ -193,10 +259,10 @@ public sealed class YoloOnnxDetector : IDisposable
                 continue;
             }
 
-            var centerX = output[0, i, 0] * scaleX;
-            var centerY = output[0, i, 1] * scaleY;
-            var width = output[0, i, 2] * scaleX;
-            var height = output[0, i, 3] * scaleY;
+            var centerX = valueAt(i, 0) * scaleX;
+            var centerY = valueAt(i, 1) * scaleY;
+            var width = valueAt(i, 2) * scaleX;
+            var height = valueAt(i, 3) * scaleY;
 
             candidates.Add(new DefectResult
             {
