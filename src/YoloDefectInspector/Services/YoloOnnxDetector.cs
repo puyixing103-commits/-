@@ -2,6 +2,7 @@ using Microsoft.ML.OnnxRuntime;
 using Microsoft.ML.OnnxRuntime.Tensors;
 using System;
 using System.Collections.Generic;
+using System.ComponentModel;
 using System.Drawing;
 using System.Drawing.Drawing2D;
 using System.Linq;
@@ -24,7 +25,47 @@ public sealed class YoloOnnxDetector : IDisposable
     public void LoadModel(string modelPath)
     {
         _session?.Dispose();
-        _session = new InferenceSession(modelPath);
+        try
+        {
+            _session = new InferenceSession(modelPath);
+        }
+        catch (TypeInitializationException ex)
+        {
+            throw BuildNativeRuntimeException(ex);
+        }
+        catch (DllNotFoundException ex)
+        {
+            throw BuildNativeRuntimeException(ex);
+        }
+        catch (BadImageFormatException ex)
+        {
+            throw BuildNativeRuntimeException(ex);
+        }
+    }
+
+    private static InvalidOperationException BuildNativeRuntimeException(Exception ex)
+    {
+        var message =
+            "ONNX Runtime 原生库加载失败。请确认：\n" +
+            "1) 应用以 x64 运行（不要用 x86）；\n" +
+            "2) 已安装 Microsoft Visual C++ 2015-2022 Redistributable (x64)；\n" +
+            "3) ONNX Runtime NuGet 包与应用位数一致。\n" +
+            $"原始错误：{GetInnermostMessage(ex)}";
+
+        return new InvalidOperationException(message, ex);
+    }
+
+    private static string GetInnermostMessage(Exception ex)
+    {
+        var current = ex;
+        while (current.InnerException is not null)
+        {
+            current = current.InnerException;
+        }
+
+        return current is Win32Exception win32
+            ? $"{win32.Message} (Win32Error={win32.NativeErrorCode})"
+            : current.Message;
     }
 
     public IReadOnlyList<DefectResult> Detect(string imagePath, float confThreshold, float iouThreshold)
@@ -45,11 +86,41 @@ public sealed class YoloOnnxDetector : IDisposable
             NamedOnnxValue.CreateFromTensor(inputName, tensor)
         };
 
-        using var results = _session.Run(inputs);
-        var output = results.First().AsTensor<float>();
-        var detections = ParseOutput(output, confThreshold, iouThreshold, scaleX, scaleY);
+        IDisposableReadOnlyCollection<DisposableNamedOnnxValue> results;
+        try
+        {
+            results = _session.Run(inputs);
+        }
+        catch (OnnxRuntimeException ex) when (IsFloat16Mismatch(ex))
+        {
+            throw new InvalidOperationException(
+                "模型输入类型为 Float16，但当前示例按 Float32 预处理。请重新导出 FP32 ONNX（不要 half/FP16 量化）。",
+                ex);
+        }
 
-        return detections;
+        using (results)
+        {
+            Tensor<float> output;
+            try
+            {
+                output = results.First().AsTensor<float>();
+            }
+            catch (OnnxRuntimeException ex) when (IsFloat16Mismatch(ex))
+            {
+                throw new InvalidOperationException(
+                    "模型输出类型为 Float16，但当前示例解析按 Float32。请改用 FP32 导出的 YOLO ONNX 模型。",
+                    ex);
+            }
+
+            var detections = ParseOutput(output, confThreshold, iouThreshold, scaleX, scaleY);
+            return detections;
+        }
+    }
+
+    private static bool IsFloat16Mismatch(OnnxRuntimeException ex)
+    {
+        return ex.Message.IndexOf("Float16", StringComparison.OrdinalIgnoreCase) >= 0 &&
+               ex.Message.IndexOf("Float", StringComparison.OrdinalIgnoreCase) >= 0;
     }
 
     private static DenseTensor<float> CreateInputTensor(Bitmap source)
