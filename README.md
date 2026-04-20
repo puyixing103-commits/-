@@ -26,3 +26,16 @@
 - 当前示例将输入固定 resize 到 `640x640`。
 - 若你的模型输出维度与 YOLOv5 不一致，请修改 `Services/YoloOnnxDetector.cs` 中 `ParseOutput` 逻辑。
 - 类别名称可在 `ViewModels/MainViewModel.cs` 中 `_labels` 数组修改。
+
+## 模型下载建议（ONNX）
+
+本项目默认按 **YOLOv5 检测头输出** 解析，建议先用官方预训练 ONNX 做联调：
+
+- 推荐：`yolov5s.onnx`（速度和精度更平衡，适合先跑通流程）
+- 版本线：`YOLOv5 v7.0`
+- 下载链接（官方 Release 直链）：
+  - https://github.com/ultralytics/yolov5/releases/download/v7.0/yolov5s.onnx
+  - https://github.com/ultralytics/yolov5/releases/download/v7.0/yolov5n.onnx
+  - https://github.com/ultralytics/yolov5/releases/download/v7.0/yolov5m.onnx
+
+如果你后续要做实际缺陷检测，建议用你自己的缺陷数据训练后再导出 ONNX（保持 `640x640` 输入更省心）。
